@@ -1,195 +1,112 @@
-# main.py  (ViridianIQ API – Groq-powered)
+# ============================  main.py  ============================
+"""
+Viridian AI backend
+-------------------------------------------------
+• Answers simple “income / super / cash” questions from the CSV
+• Generates a bar-chart (base-64 PNG) when a question contains “chart”
+• Falls back to Groq’s free Mixtral model for anything else
+• Returns: { "answer": "...", "chart_base64": <None or str> }
+"""
 
-from __future__ import annotations
-
-import os
-import re
-import io
-import base64
-from typing import List
-
+from fastapi import FastAPI
+from pydantic import BaseModel
 import pandas as pd
+import os, io, base64, subprocess
+
+# ---------- optional chart libs (head-less) ----------
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+app = FastAPI()
 
-import openai            # ↳ works for Groq because the endpoint is OpenAI-compatible
+# ---------- load client data ----------
+df = pd.read_csv("mock_wealth_clients_with_names.csv")
 
-# ------------------------------------------------------------------------------
-#  Groq / OpenAI client setup ---------------------------------------------------
-# ------------------------------------------------------------------------------
-
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # e.g. https://api.groq.com/openai/v1
-
-if not (OPENAI_API_KEY and OPENAI_BASE_URL):
-    raise RuntimeError("OPENAI_API_KEY and/or OPENAI_BASE_URL env-vars missing!")
-
-openai.api_key  = OPENAI_API_KEY
-openai.base_url = OPENAI_BASE_URL   # IMPORTANT – points the SDK at Groq
-
-LLM_MODEL = "mixtral-8x7b-32768"     # Groq’s best free model; change if you like
-
-
-# ------------------------------------------------------------------------------
-#  FastAPI boiler-plate ---------------------------------------------------------
-# ------------------------------------------------------------------------------
-
-app = FastAPI(title="ViridianIQ AI backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],          # tighten in prod
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ------------------------------------------------------------------------------
-#  Data – load once at start ----------------------------------------------------
-# ------------------------------------------------------------------------------
-
-CLIENT_DF = pd.read_csv("mock_wealth_clients_with_names.csv")
-
-NUMERIC_COLS = {
-    "annual_income": "Annual_Income",
-    "super_balance": "Super_Balance",
-    "investment_assets": "Investment_Assets",
-    "cash_savings": "Cash_Savings",
-    "debt": "Debt",
-}
-
-
-# ------------------------------------------------------------------------------
-#  Helpers ----------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-
-def list_clients_where(col: str, op: str, threshold: float) -> List[str]:
-    """Return a python list of client names satisfying a numeric comparison."""
-    if col not in NUMERIC_COLS:
-        raise KeyError(f"Unknown numeric field '{col}'")
-
-    series = CLIENT_DF[NUMERIC_COLS[col]]
-
-    if   op == ">":  mask = series >  threshold
-    elif op == "<":  mask = series <  threshold
-    elif op == ">=": mask = series >= threshold
-    elif op == "<=": mask = series <= threshold
-    elif op == "==": mask = series == threshold
-    else:
-        raise ValueError(f"Unsupported operator {op}")
-
-    return CLIENT_DF.loc[mask, "Name"].tolist()
-
-
-def make_pie_for_client(name: str) -> str:
-    """Return a base-64 PNG of a client’s asset allocation pie chart."""
-    row = CLIENT_DF.loc[CLIENT_DF["Name"] == name]
-    if row.empty:
-        raise KeyError("Client not found")
-
-    row = row.iloc[0]
-    labels = ["Super", "Investments", "Cash"]
-    sizes  = [row["Super_Balance"], row["Investment_Assets"], row["Cash_Savings"]]
-
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.pie(sizes, labels=labels, autopct="%1.0f%%", startangle=140)
-    ax.set_title(f"{name} – asset allocation")
-
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def ask_groq(prompt: str) -> str:
-    """Forward the question to Groq (OpenAI-compatible endpoint)."""
-    response = openai.chat.completions.create(
-        model   = LLM_MODEL,
-        messages=[
-            {"role": "system", "content": "You are ViridianIQ's wealth-advisor copilot."},
-            {"role": "user",    "content": prompt},
-        ],
-        max_tokens=512,
-        temperature=0.3,
-    )
-    return response.choices[0].message.content.strip()
-
-
-# ------------------------------------------------------------------------------
-#  API schema -------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-
-class Ask(BaseModel):
+class Query(BaseModel):
     question: str
 
 
-class AIResponse(BaseModel):
-    answer: str
-    chart_base64: str | None = None     # pie-chart when requested
+# ---------- helper: make bar chart & return b64 ----------
+def build_income_chart(top_n: int = 5) -> str:
+    top = df.nlargest(top_n, "Annual_Income")[["Name", "Annual_Income"]]
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.barh(top["Name"], top["Annual_Income"], color="#1f77b4")
+    ax.set_xlabel("Annual Income ($)")
+    ax.set_title(f"Top-{top_n} client incomes")
+    ax.invert_yaxis()
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
-# ------------------------------------------------------------------------------
-#  /ask endpoint ----------------------------------------------------------------
-# ------------------------------------------------------------------------------
+# ---------- MAIN ENDPOINT ----------
+@app.post("/ask")
+def ask_ai(query: Query):
+    q = query.question.lower()
 
-@app.post("/ask", response_model=AIResponse)
-def ask_endpoint(payload: Ask):
-    q = payload.question.strip()
+    # ----- 1) chart requested? -----
+    if "chart" in q:
+        chart_b64 = build_income_chart()
+        return {
+            "answer": "Here’s the chart you asked for:",
+            "chart_base64": chart_b64,
+        }
 
-    # ------------------------------------------------------------------
-    #  1) Simple hard-coded look-ups (name + keyword) ------------------
-    # ------------------------------------------------------------------
-    lowered = q.lower()
-    for name in CLIENT_DF["Name"]:
-        if name.lower() in lowered:
-            row = CLIENT_DF[CLIENT_DF["Name"] == name].iloc[0]
+    # ----- 2) quick CSV look-ups -----
+    name_match = [n for n in df["Name"] if n.lower() in q]
+    if name_match:
+        client = df.loc[df["Name"] == name_match[0]].iloc[0]
 
-            if "income" in lowered:
-                return AIResponse(
-                    answer=f"{name}'s annual income is ${row['Annual_Income']:,}."
-                )
-            if "super" in lowered:
-                return AIResponse(
-                    answer=f"{name}'s super balance is ${row['Super_Balance']:,}."
-                )
-            if any(k in lowered for k in ["cash", "savings"]):
-                return AIResponse(
-                    answer=f"{name} has ${row['Cash_Savings']:,} in cash savings."
-                )
-            if "show pie" in lowered or "asset chart" in lowered:
-                chart_b64 = make_pie_for_client(name)
-                return AIResponse(
-                    answer="Here is the asset allocation chart.",
-                    chart_base64=chart_b64,
-                )
+        if "income" in q:
+            return {
+                "answer": f"{client['Name']}'s annual income is "
+                          f"${client['Annual_Income']:,}.",
+                "chart_base64": None,
+            }
+        if "super" in q:
+            return {
+                "answer": f"{client['Name']}'s super balance is "
+                          f"${client['Super_Balance']:,}.",
+                "chart_base64": None,
+            }
+        if "cash" in q or "savings" in q:
+            return {
+                "answer": f"{client['Name']} has "
+                          f"${client['Cash_Savings']:,} in cash savings.",
+                "chart_base64": None,
+            }
 
-    # ------------------------------------------------------------------
-    # 2) Aggregate queries like “clients with cash > 100000” ------------
-    # ------------------------------------------------------------------
-    m = re.search(
-        r"(?:clients?|people)\s+with\s+(cash savings|super balance|annual income)"
-        r"\s*(>=|>|<=|<|=|==)\s*\$?([\d,\.]+)",
-        lowered,
-    )
-    if m:
-        field_text, op, num_txt = m.groups()
-        field_key = field_text.replace(" ", "_")
-        threshold = float(num_txt.replace(",", ""))
-        names = list_clients_where(field_key, op, threshold)
-        if not names:
-            return AIResponse(answer="No clients meet that criterion.")
-        return AIResponse(
-            answer=f"{len(names)} clients meet the condition: {', '.join(names)}."
+    # ----- 3) fallback → Groq LLM (OpenAI-compatible client) -----
+    try:
+        import openai
+
+        openai.api_key = os.environ["OPENAI_API_KEY"]          # your gsk_ key
+        openai.api_base = os.environ.get(
+            "OPENAI_BASE_URL", "https://api.groq.com/openai/v1"
         )
 
-    # ------------------------------------------------------------------
-    # 3) Anything else → Groq LLM --------------------------------------
-    # ------------------------------------------------------------------
-    try:
-        answer = ask_groq(q)
-        return AIResponse(answer=answer)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq API error: {exc}") from exc
+        resp = openai.ChatCompletion.create(
+            model="mixtral-8x7b-32768",
+            messages=[{"role": "user", "content": query.question}],
+            max_tokens=512,
+        )
+        answer_text = resp.choices[0].message.content.strip()
+
+        return {"answer": answer_text, "chart_base64": None}
+
+    except Exception as e:
+        # as a last resort try the local Ollama model if it’s bundled
+        try:
+            ollama_resp = subprocess.run(
+                ["ollama", "run", "llama3", query.question],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return {"answer": ollama_resp.stdout.strip(), "chart_base64": None}
+        except Exception:
+            return {"answer": f"AI fallback failed: {e}", "chart_base64": None}
