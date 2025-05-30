@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pandas
-openai>=1.14 
+openai>=1.14      # Groq speaks the OpenAI SDK
+tiktoken>=0.6
 matplotlib>=3.8
