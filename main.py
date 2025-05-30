@@ -1,9 +1,19 @@
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import subprocess
 
 app = FastAPI()
+
+# ✅ Enable CORS to allow frontend (like Lovable) to connect
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # You can replace "*" with your actual frontend URL for better security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load your client CSV
 df = pd.read_csv("mock_wealth_clients_with_names.csv")
