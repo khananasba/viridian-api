@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 pandas
+openai>=1.14 
 matplotlib>=3.8
-openai>=1.14
