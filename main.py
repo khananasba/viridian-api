@@ -1,24 +1,28 @@
-# ---------------- standard libs ----------------
-import os, io, base64, logging, traceback, subprocess
-
-# ---------------- 3rd-party libs ---------------
+import os, io, base64, logging, traceback, re
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
+
+# ─── optional head-less chart libs ──────────────────────────────────────────────
 import matplotlib
-matplotlib.use("Agg")          # head-less backend for Render
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import openai                  # works for Groq-compat too
 
-# ================= FastAPI app =================
+# ─── Groq / OpenAI-compatible client ───────────────────────────────────────────
+from openai import OpenAI                        # requires openai>=1.14
+
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
+
+llm = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+
+# ─── FastAPI + CORS for Lovable front-end ──────────────────────────────────────
 app = FastAPI()
-
-# --- allow Lovable (or ANY origin) to call the API ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # tighten to ["https://your-lovable-url.com"] if you wish
+    allow_origins=["*"],          # or restrict to ["https://your-lovable-url.com"]
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=False,
@@ -26,95 +30,122 @@ app.add_middleware(
 
 logger = logging.getLogger("uvicorn.error")
 
-# ================== external LLM ===============
-openai.api_key  = os.getenv("OPENAI_API_KEY", "")
-openai.base_url = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-
-# ================ load client CSV ==============
+# ─── load the client CSV once at start-up ───────────────────────────────────────
 df = pd.read_csv("mock_wealth_clients_with_names.csv")
 
-# ================ schema =======================
 class Query(BaseModel):
     question: str
 
-# ================ helpers ======================
-def generate_chart(client_row: pd.Series) -> str | None:
-    """
-    Build a pie chart of a single client’s asset split (Cash vs Super).
-    Returns a base64 PNG or None if we decide no chart is needed.
-    """
-    labels  = ["Cash Savings", "Super Balance"]
-    sizes   = [client_row["Cash_Savings"], client_row["Super_Balance"]]
+# ─── helper: numeric text → plain number string ────────────────────────────────
+def _to_number(txt: str) -> str:
+    txt = txt.lower().replace("$", "").replace(",", "").strip()
+    if txt.endswith("k"):
+        return str(float(txt[:-1]) * 1_000)
+    if txt.endswith("m"):
+        return str(float(txt[:-1]) * 1_000_000)
+    return txt
+
+# ─── helper: natural text condition → pandas query string ──────────────────────
+_field_map = {
+    "cash savings":  "Cash_Savings",
+    "cash":          "Cash_Savings",
+    "savings":       "Cash_Savings",
+    "annual income": "Annual_Income",
+    "income":        "Annual_Income",
+    "super balance": "Super_Balance",
+    "super":         "Super_Balance",
+}
+_op_map = {
+    "greater than": ">",
+    "more than":    ">",
+    ">":            ">",
+    "less than":    "<",
+    "<":            "<",
+    "equals":       "==",
+    "=":            "==",
+}
+def normalise_condition(question: str) -> str:
+    q = question.lower()
+    # locate metric
+    field = next((col for hint, col in _field_map.items() if hint in q), None)
+    if not field:
+        raise ValueError("metric not recognised")
+
+    m = re.search(r"(greater than|more than|less than|equals|[><=])\s+\$?([\d,\.]+[kKmM]?)", q)
+    if not m:
+        raise ValueError("value/comparator not recognised")
+    op    = _op_map[m.group(1)]
+    value = _to_number(m.group(2))
+    return f"{field} {op} {value}"
+
+# ─── helper: tiny pie chart → base64 string ─────────────────────────────────────
+def create_pie_chart(row: pd.Series) -> str:
+    labels = ["Cash Savings", "Super Balance"]
+    sizes  = [row["Cash_Savings"], row["Super_Balance"]]
+    colors = ["#1f77b4", "#ff7f0e"]
 
     fig, ax = plt.subplots(figsize=(4, 4))
-    ax.pie(sizes, labels=labels, autopct="%1.0f%%")
-    ax.set_title(f"{client_row['Name']} – asset mix")
-
+    ax.pie(sizes, labels=labels, colors=colors, autopct="%1.0f%%")
+    ax.set_title(f"{row['Name']} – asset mix")
     buf = io.BytesIO()
     plt.tight_layout()
-    fig.savefig(buf, format="png", dpi=110)
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
 
-def ask_groq_llm(prompt: str) -> str:
-    """
-    Send the prompt to Groq’s OpenAI-compatible endpoint (model 'mixtral-8x7b-32768' or similar).
-    """
+# ─── core QA dispatcher ────────────────────────────────────────────────────────
+def handle_question(q: str) -> tuple[str, str]:
+    q_lower = q.lower()
+
+    # 1️⃣ direct single-client look-ups
+    name_hits = [n for n in df["Name"] if n.lower() in q_lower]
+    if name_hits:
+        client = df[df["Name"] == name_hits[0]].iloc[0]
+        if "income" in q_lower:
+            return f"{client['Name']}'s annual income is ${client['Annual_Income']:,}.", ""
+        if "super" in q_lower:
+            return f"{client['Name']}'s super balance is ${client['Super_Balance']:,}.", ""
+        if "cash" in q_lower or "savings" in q_lower:
+            return f"{client['Name']} has ${client['Cash_Savings']:,} in cash savings.", ""
+        if "chart" in q_lower:
+            return "Here’s the asset split chart.", create_pie_chart(client)
+
+    # 2️⃣ filtered list / aggregate
     try:
-        completion = openai.ChatCompletion.create(
-            model="mixtral-8x7b-32768",
-            messages=[{"role":"user","content": prompt}],
-            timeout=15,
-        )
-        return completion.choices[0].message.content.strip()
+        query_string = normalise_condition(q_lower)
+        filtered_df  = df.query(query_string)
+
+        if filtered_df.empty:
+            return "No clients match that filter.", ""
+
+        if "how many" in q_lower or "count" in q_lower:
+            return f"{len(filtered_df)} clients match that condition.", ""
+
+        names = "\n".join(f"- {n}" for n in filtered_df["Name"])
+        return names, ""
     except Exception as e:
-        logger.error("Groq LLM call failed: %s", e)
-        return "Sorry, I couldn’t reach the language model right now."
+        # log + fallback to LLM
+        logger.info("tabular parse miss: %s", e)
 
-def handle_question(q: str) -> tuple[str, str | None]:
-    """
-    Core logic – returns (answer, optional_chart_b64)
-    """
-    question = q.lower()
-    # try to locate a client name mentioned in the question
-    names = [name for name in df["Name"] if name.lower() in question]
-    if not names:
-        # let Groq handle free-form questions that aren’t client-specific
-        return ask_groq_llm(q), None
-
-    client = df[df["Name"] == names[0]].iloc[0]
-
-    # ---- hard-coded examples ---------------------------------
-    if "income" in question:
-        return (
-            f"{client['Name']}'s annual income is ${client['Annual_Income']:,}.",
-            None,
+    # 3️⃣ fallback: Groq Llama-3
+    if not OPENAI_API_KEY:
+        return "Language model not configured on server.", ""
+    try:
+        chat = llm.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system",
+                 "content": "You are a helpful financial assistant with access to some client data."},
+                {"role": "user", "content": q},
+            ],
+            max_tokens=256,
         )
-    if "super" in question:
-        return (
-            f"{client['Name']}'s super balance is ${client['Super_Balance']:,}.",
-            None,
-        )
-    if "cash" in question or "savings" in question:
-        return (
-            f"{client['Name']} has ${client['Cash_Savings']:,} in cash savings.",
-            None,
-        )
-    if "asset mix" in question or "chart" in question:
-        ch_b64 = generate_chart(client)
-        return "Here’s the asset split chart.", ch_b64
+        return chat.choices[0].message.content.strip(), ""
+    except Exception:
+        logger.error("Groq LLM call failed:\n%s", traceback.format_exc())
+        return "Sorry, I couldn’t reach the language model right now.", ""
 
-    # Fallback → combine CSV facts + Groq reasoning
-    sys_prompt = (
-        "You are an AI wealth-management assistant. "
-        "Use the structured data provided if relevant; otherwise think step-by-step."
-    )
-    full_prompt = (
-        f"{sys_prompt}\n\nStructured data:\n{client.to_json()}\n\nUser question: {q}"
-    )
-    return ask_groq_llm(full_prompt), None
-
-# ============= FastAPI route ===================
+# ─── FastAPI route ─────────────────────────────────────────────────────────────
 @app.post("/ask")
 def ask_ai(query: Query):
     try:
@@ -124,8 +155,5 @@ def ask_ai(query: Query):
         logger.error("Unhandled error\n%s", traceback.format_exc())
         return JSONResponse(
             status_code=200,
-            content={
-                "answer": "Sorry, I hit an internal error.",
-                "chart_base64": "",
-            },
+            content={"answer": "Sorry, I hit an internal error.", "chart_base64": ""}
         )
