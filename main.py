@@ -1,159 +1,192 @@
-import os, io, base64, logging, traceback, re
+# ===================== main.py =====================
+import os, io, base64, logging, traceback, re, numpy as np
+from datetime import datetime, timedelta
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
+import matplotlib, matplotlib.pyplot as plt
 
-# ─── optional head-less chart libs ──────────────────────────────────────────────
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+matplotlib.use("Agg")  # head-less backend for Render
 
-# ─── Groq / OpenAI-compatible client ───────────────────────────────────────────
-from openai import OpenAI                        # requires openai>=1.14
+from openai import OpenAI  # OpenAI-compatible; points to Groq
 
+# ── Groq / OpenAI client ───────────────────────────
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
-
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 llm = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
-# ─── FastAPI + CORS for Lovable front-end ──────────────────────────────────────
+# ── FastAPI + CORS ─────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # or restrict to ["https://your-lovable-url.com"]
+    allow_origins=["*"],   # tighten for prod
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=False,
 )
 
 logger = logging.getLogger("uvicorn.error")
 
-# ─── load the client CSV once at start-up ───────────────────────────────────────
+# ── Load client CSV once ───────────────────────────
 df = pd.read_csv("mock_wealth_clients_with_names.csv")
 
 class Query(BaseModel):
     question: str
 
-# ─── helper: numeric text → plain number string ────────────────────────────────
-def _to_number(txt: str) -> str:
-    txt = txt.lower().replace("$", "").replace(",", "").strip()
-    if txt.endswith("k"):
-        return str(float(txt[:-1]) * 1_000)
-    if txt.endswith("m"):
-        return str(float(txt[:-1]) * 1_000_000)
-    return txt
-
-# ─── helper: natural text condition → pandas query string ──────────────────────
-_field_map = {
-    "cash savings":  "Cash_Savings",
-    "cash":          "Cash_Savings",
-    "savings":       "Cash_Savings",
-    "annual income": "Annual_Income",
-    "income":        "Annual_Income",
-    "super balance": "Super_Balance",
-    "super":         "Super_Balance",
-}
-_op_map = {
-    "greater than": ">",
-    "more than":    ">",
-    ">":            ">",
-    "less than":    "<",
-    "<":            "<",
-    "equals":       "==",
-    "=":            "==",
-}
-def normalise_condition(question: str) -> str:
-    q = question.lower()
-    # locate metric
-    field = next((col for hint, col in _field_map.items() if hint in q), None)
-    if not field:
-        raise ValueError("metric not recognised")
-
-    m = re.search(r"(greater than|more than|less than|equals|[><=])\s+\$?([\d,\.]+[kKmM]?)", q)
-    if not m:
-        raise ValueError("value/comparator not recognised")
-    op    = _op_map[m.group(1)]
-    value = _to_number(m.group(2))
-    return f"{field} {op} {value}"
-
-# ─── helper: tiny pie chart → base64 string ─────────────────────────────────────
-def create_pie_chart(row: pd.Series) -> str:
-    labels = ["Cash Savings", "Super Balance"]
-    sizes  = [row["Cash_Savings"], row["Super_Balance"]]
-    colors = ["#1f77b4", "#ff7f0e"]
-
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.pie(sizes, labels=labels, colors=colors, autopct="%1.0f%%")
-    ax.set_title(f"{row['Name']} – asset mix")
+# ╭───────────────────────── Chart helpers ──────────────────────────╮
+def _fig_to_b64(fig) -> str:
     buf = io.BytesIO()
-    plt.tight_layout()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
 
-# ─── core QA dispatcher ────────────────────────────────────────────────────────
-def handle_question(q: str) -> tuple[str, str]:
-    q_lower = q.lower()
+def pie_asset_mix(row: pd.Series) -> str:
+    labels = ["Cash", "Super"]
+    sizes  = [row["Cash_Savings"], row["Super_Balance"]]
+    fig, ax = plt.subplots(figsize=(4,4))
+    ax.pie(sizes, labels=labels, autopct="%1.0f%%", colors=["#1f77b4", "#ff7f0e"])
+    ax.set_title(f"{row['Name']} – asset mix")
+    return _fig_to_b64(fig)
 
-    # 1️⃣ direct single-client look-ups
-    name_hits = [n for n in df["Name"] if n.lower() in q_lower]
-    if name_hits:
-        client = df[df["Name"] == name_hits[0]].iloc[0]
-        if "income" in q_lower:
-            return f"{client['Name']}'s annual income is ${client['Annual_Income']:,}.", ""
-        if "super" in q_lower:
-            return f"{client['Name']}'s super balance is ${client['Super_Balance']:,}.", ""
-        if "cash" in q_lower or "savings" in q_lower:
-            return f"{client['Name']} has ${client['Cash_Savings']:,} in cash savings.", ""
-        if "chart" in q_lower:
-            return "Here’s the asset split chart.", create_pie_chart(client)
+def bar_compare_two(row_a, row_b) -> str:
+    labels = [row_a["Name"], row_b["Name"]]
+    width  = 0.25
+    x = np.arange(len(labels))
+    metrics = [("Cash_Savings", "#4e79a7"),
+               ("Super_Balance", "#9c755f"),
+               ("Annual_Income", "#f28e2b")]
+    fig, ax = plt.subplots(figsize=(6,3))
+    for i, (m, c) in enumerate(metrics):
+        ax.bar(x+i*width, [row_a[m], row_b[m]], width=width,
+               label=m.replace("_"," "), color=c)
+    ax.set_xticks(x+width)
+    ax.set_xticklabels(labels)
+    ax.set_title("Client comparison")
+    ax.legend()
+    return _fig_to_b64(fig)
 
-    # 2️⃣ filtered list / aggregate
+def bar_returns_single(row) -> str:
+    metrics = [("Cash_Savings", "#4e79a7"),
+               ("Super_Balance", "#9c755f"),
+               ("Investment_Assets", "#59a14f")]
+    returns = np.random.uniform(3, 15, len(metrics))  # mock annual returns %
+    fig, ax = plt.subplots(figsize=(4,3))
+    ax.bar([m[0].replace("_"," ") for m in metrics], returns,
+           color=[c for _,c in metrics])
+    ax.set_ylabel("Annual return (%)")
+    ax.set_title(f"{row['Name']} – mock returns by asset class")
+    return _fig_to_b64(fig)
+
+def column_portfolio(row) -> str:
+    metrics = [("Cash_Savings","#4e79a7"),
+               ("Super_Balance","#9c755f"),
+               ("Investment_Assets","#59a14f")]
+    fig, ax = plt.subplots(figsize=(4,3))
+    ax.bar([m[0].replace("_"," ") for m in metrics],
+           [row[m[0]] for m in metrics],
+           color=[c for _,c in metrics])
+    ax.set_ylabel("AUD")
+    ax.set_title(f"{row['Name']} – asset columns")
+    return _fig_to_b64(fig)
+
+def line_portfolio_growth(row, months=12) -> str:
+    today = datetime.today()
+    dates = [today - timedelta(days=30*i) for i in reversed(range(months))]
+    total_assets = (row["Cash_Savings"]+row["Super_Balance"]+row["Investment_Assets"])
+    values = np.linspace(total_assets*0.85, total_assets, months) * np.random.uniform(0.96,1.04,months)
+    fig, ax = plt.subplots(figsize=(5,3))
+    ax.plot(dates, values, marker="o")
+    ax.set_ylabel("AUD")
+    ax.set_title(f"{row['Name']} – portfolio performance (simulated)")
+    fig.autofmt_xdate()
+    return _fig_to_b64(fig)
+
+def scatter_cash_vs_super() -> str:
+    fig, ax = plt.subplots(figsize=(5,4))
+    ax.scatter(df["Cash_Savings"], df["Super_Balance"], alpha=0.7)
+    for _, r in df.iterrows():
+        ax.annotate(r["Name"].split()[0], (r["Cash_Savings"], r["Super_Balance"]), fontsize=6)
+    ax.set_xlabel("Cash Savings")
+    ax.set_ylabel("Super Balance")
+    ax.set_title("Cash vs Super across clients")
+    return _fig_to_b64(fig)
+
+# ╭───────────────────────── Number-filter helpers ─────────────────╮
+def _to_num(txt: str) -> str:
+    txt = txt.lower().replace("$","").replace(",","").strip()
+    if txt.endswith("k"): return str(float(txt[:-1])*1_000)
+    if txt.endswith("m"): return str(float(txt[:-1])*1_000_000)
+    return txt
+
+_field_map = {
+    "cash savings":"Cash_Savings","cash":"Cash_Savings","savings":"Cash_Savings",
+    "annual income":"Annual_Income","income":"Annual_Income",
+    "super balance":"Super_Balance","super":"Super_Balance",
+}
+_op_map = {"greater than":">","more than":">",">":">",
+           "less than":"<","<":"<","equals":"==","=":"=="}
+
+def to_query(q: str) -> str:
+    field = next((col for k,col in _field_map.items() if k in q), None)
+    m = re.search(r"(greater than|more than|less than|equals|[><=])\s+\$?([\d,\.]+[kKmM]?)", q)
+    if not field or not m: raise ValueError
+    op = _op_map[m.group(1)]; val = _to_num(m.group(2))
+    return f"{field} {op} {val}"
+
+# ╭───────────────────────── Core dispatcher ───────────────────────╮
+def handle_question(q: str) -> tuple[str,str]:
+    ql = q.lower()
+    hits = [n for n in df["Name"] if n.lower() in ql]
+
+    # A) single-client quick answers / charts
+    if hits:
+        row = df[df["Name"] == hits[0]].iloc[0]
+        if "income" in ql: return f"{row['Name']}'s annual income is ${row['Annual_Income']:,}.", ""
+        if "super"  in ql and "trend" not in ql: return f"{row['Name']}'s super balance is ${row['Super_Balance']:,}.", ""
+        if "cash" in ql and "savings" in ql: return f"{row['Name']} has ${row['Cash_Savings']:,} in cash savings.", ""
+        if "pie chart" in ql or "asset mix" in ql: return "Pie chart of asset mix.", pie_asset_mix(row)
+        if "column chart" in ql or "asset columns" in ql: return "Column chart of asset breakdown.", column_portfolio(row)
+        if "bar chart" in ql and "return" in ql: return "Bar chart of asset-class returns.", bar_returns_single(row)
+        if "line chart" in ql or "portfolio performance" in ql or "super trend" in ql: return "Line chart of portfolio performance.", line_portfolio_growth(row)
+
+    # B) two-client comparison bar chart
+    if "compare" in ql and len(hits) == 2 and "chart" in ql:
+        a,b = (df[df["Name"]==n].iloc[0] for n in hits)
+        return "Comparison bar chart.", bar_compare_two(a,b)
+
+    # C) scatter plot across all clients
+    if "scatter" in ql or "relationship" in ql:
+        return "Scatter plot of cash vs super.", scatter_cash_vs_super()
+
+    # D) numeric filter list / count
     try:
-        query_string = normalise_condition(q_lower)
-        filtered_df  = df.query(query_string)
+        query = to_query(ql); sub = df.query(query)
+        if sub.empty: return "No clients match that filter.", ""
+        if "how many" in ql or "count" in ql: return f"{len(sub)} clients match that condition.", ""
+        return "\n".join(f"- {n}" for n in sub["Name"]), ""
+    except Exception: pass  # fall through to LLM
 
-        if filtered_df.empty:
-            return "No clients match that filter.", ""
-
-        if "how many" in q_lower or "count" in q_lower:
-            return f"{len(filtered_df)} clients match that condition.", ""
-
-        names = "\n".join(f"- {n}" for n in filtered_df["Name"])
-        return names, ""
-    except Exception as e:
-        # log + fallback to LLM
-        logger.info("tabular parse miss: %s", e)
-
-    # 3️⃣ fallback: Groq Llama-3
-    if not OPENAI_API_KEY:
-        return "Language model not configured on server.", ""
+    # E) LLM fallback
     try:
         chat = llm.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=[
-                {"role": "system",
-                 "content": "You are a helpful financial assistant with access to some client data."},
-                {"role": "user", "content": q},
-            ],
+            model="llama3-70b-8192",
+            messages=[{"role":"user","content": q}],
             max_tokens=256,
         )
         return chat.choices[0].message.content.strip(), ""
     except Exception:
-        logger.error("Groq LLM call failed:\n%s", traceback.format_exc())
+        logger.error("LLM fail\n%s", traceback.format_exc())
         return "Sorry, I couldn’t reach the language model right now.", ""
 
-# ─── FastAPI route ─────────────────────────────────────────────────────────────
+# ╭───────────────────────── FastAPI route ─────────────────────────╮
 @app.post("/ask")
 def ask_ai(query: Query):
     try:
-        answer, chart64 = handle_question(query.question)
-        return {"answer": answer, "chart_base64": chart64 or ""}
+        ans, img = handle_question(query.question)
+        return {"answer": ans, "chart_base64": img}
     except Exception:
-        logger.error("Unhandled error\n%s", traceback.format_exc())
-        return JSONResponse(
-            status_code=200,
-            content={"answer": "Sorry, I hit an internal error.", "chart_base64": ""}
-        )
+        logger.error("Unhandled\n%s", traceback.format_exc())
+        return JSONResponse(status_code=200,
+            content={"answer":"Sorry, an internal error occurred.","chart_base64":""})
+# ===================== end main.py =====================
