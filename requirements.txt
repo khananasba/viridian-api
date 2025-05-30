@@ -1,3 +1,6 @@
 fastapi
 uvicorn
 pandas
+openai>=1.14
+tiktoken>=0.6
+matplotlib>=3.8
